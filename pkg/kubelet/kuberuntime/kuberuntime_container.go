@@ -122,6 +122,11 @@ func (m *kubeGenericRuntimeManager) startContainer(podSandboxID string, podSandb
 		m.recordContainerEvent(pod, container, containerID, v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", grpc.ErrorDesc(err))
 		return grpc.ErrorDesc(err), ErrCreateContainer
 	}
+
+	if pod != nil && container != nil {
+		glog.V(2).Infof("Created container %s::%s::%s", pod.Name, container.Name, containerID)
+	}
+
 	err = m.internalLifecycle.PreStartContainer(pod, container, containerID)
 	if err != nil {
 		m.recordContainerEvent(pod, container, containerID, v1.EventTypeWarning, events.FailedToStartContainer, "Internal PreStartContainer hook failed: %v", grpc.ErrorDesc(err))
@@ -142,6 +147,11 @@ func (m *kubeGenericRuntimeManager) startContainer(podSandboxID string, podSandb
 		m.recordContainerEvent(pod, container, containerID, v1.EventTypeWarning, events.FailedToStartContainer, "Error: %v", grpc.ErrorDesc(err))
 		return grpc.ErrorDesc(err), kubecontainer.ErrRunContainer
 	}
+
+	if pod != nil && container != nil {
+		glog.V(2).Infof("Started container %s::%s::%s", pod.Name, container.Name, containerID)
+	}
+
 	m.recordContainerEvent(pod, container, containerID, v1.EventTypeNormal, events.StartedContainer, "Started container")
 
 	// Symlink container logs to the legacy container log location for cluster logging
@@ -552,7 +562,7 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 		gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
 	}
 
-	glog.V(2).Infof("Killing container %q with %d second grace period", containerID.String(), gracePeriod)
+	glog.V(2).Infof("Killing container %q(%q) in pod %q with %d second grace period", containerName, containerID.String(), pod.Name, gracePeriod)
 
 	// Run internal pre-stop lifecycle hook
 	if err := m.internalLifecycle.PreStopContainer(containerID.ID); err != nil {
@@ -571,12 +581,11 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 		gracePeriod = *gracePeriodOverride
 		glog.V(3).Infof("Killing container %q, but using %d second grace period override", containerID, gracePeriod)
 	}
-
 	err := m.runtimeService.StopContainer(containerID.ID, gracePeriod)
 	if err != nil {
 		glog.Errorf("Container %q termination failed with gracePeriod %d: %v", containerID.String(), gracePeriod, err)
 	} else {
-		glog.V(3).Infof("Container %q exited normally", containerID.String())
+		glog.V(2).Infof("Container %q exited normally", containerID.String())
 	}
 
 	message := fmt.Sprintf("Killing container with id %s", containerID.String())
@@ -591,6 +600,7 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 
 // killContainersWithSyncResult kills all pod's containers with sync results.
 func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
+	glog.V(2).Infof("Killing containers from pod %s/%s with gracePeriodOverride %d", pod.Namespace, pod.Name, *gracePeriodOverride)
 	containerResults := make(chan *kubecontainer.SyncResult, len(runningPod.Containers))
 	wg := sync.WaitGroup{}
 

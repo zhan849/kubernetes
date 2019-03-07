@@ -17,6 +17,7 @@ limitations under the License.
 package flexvolume
 
 import (
+	"github.com/golang/glog"
 	"os"
 	"strconv"
 
@@ -82,7 +83,11 @@ func (f *flexVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
 
 	call.AppendSpec(f.spec, f.plugin.host, extraOptions)
 
-	_, err = call.Run()
+	var ret *DriverStatus
+	ret, err = call.Run()
+	if err != nil {
+		glog.Warningf("Failed to make flex volume call. Ret: %+v; Error: %+v; Falling back to default SetUpAt", ret, err)
+	}
 	if isCmdNotSupportedErr(err) {
 		err = (*mounterDefaults)(f).SetUpAt(dir, fsGroup)
 	}

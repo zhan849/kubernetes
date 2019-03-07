@@ -227,6 +227,11 @@ func (g *GenericPLEG) relist() {
 	// podCache.
 	for pid, events := range eventsByPodID {
 		pod := g.podRecords.getCurrent(pid)
+		var eventsShort []string
+		for _, e := range events {
+			eventsShort = append(eventsShort, fmt.Sprintf("%s::%s", e.ID, e.Type))
+		}
+
 		if g.cacheEnabled() {
 			// updateCache() will inspect the pod and update the cache. If an
 			// error occurs during the inspection, we want PLEG to retry again
@@ -238,11 +243,10 @@ func (g *GenericPLEG) relist() {
 			// serially may take a while. We should be aware of this and
 			// parallelize if needed.
 			if err := g.updateCache(pod, pid); err != nil {
-				glog.Errorf("PLEG: Ignoring events for pod %s/%s: %v", pod.Name, pod.Namespace, err)
+				glog.Errorf("PLEG: Ignoring events %v for pod %s/%s: %v", eventsShort, pod.Name, pod.Namespace, err)
 
 				// make sure we try to reinspect the pod during the next relisting
 				needsReinspection[pid] = pod
-
 				continue
 			} else if _, found := g.podsToReinspect[pid]; found {
 				// this pod was in the list to reinspect and we did so because it had events, so remove it
@@ -253,6 +257,10 @@ func (g *GenericPLEG) relist() {
 		}
 		// Update the internal storage and send out the events.
 		g.podRecords.update(pid)
+		if pod != nil {
+			glog.V(2).Infof("Events for Pod %s(%s): %v", pod.ID, pod.Name, eventsShort)
+		}
+
 		for i := range events {
 			// Filter out events that are not reliable and no other components use yet.
 			if events[i].Type == ContainerChanged {

@@ -1935,6 +1935,7 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 
 		if e.Type == pleg.ContainerDied {
 			if containerID, ok := e.Data.(string); ok {
+				glog.V(2).Infof("SyncLoop (PLEG): deleting died container %s in pod %s", containerID, e.ID)
 				kl.cleanUpContainersInPod(e.ID, containerID)
 			}
 		}
@@ -2116,6 +2117,7 @@ func (kl *Kubelet) HandlePodReconcile(pods []*v1.Pod) {
 		// After an evicted pod is synced, all dead containers in the pod can be removed.
 		if eviction.PodIsEvicted(pod.Status) {
 			if podStatus, err := kl.podCache.Get(pod.UID); err == nil {
+				glog.V(2).Infof("kubelet.HandlePodReconcile deleting all containers in Pod %s/%s", pod.Namespace, pod.Name)
 				kl.containerDeletor.deleteContainersInPod("", podStatus, true)
 			}
 		}

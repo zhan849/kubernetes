@@ -612,7 +612,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, _ v1.PodStatus, podStat
 	} else {
 		// Step 3: kill any running containers in this pod which are not to keep.
 		for containerID, containerInfo := range podContainerChanges.ContainersToKill {
-			glog.V(3).Infof("Killing unwanted container %q(id=%q) for pod %q", containerInfo.name, containerID, format.Pod(pod))
+			glog.V(2).Infof("Killing unwanted container %q(id=%q) for pod %q", containerInfo.name, containerID, format.Pod(pod))
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, containerInfo.name)
 			result.AddSyncResult(killContainerResult)
 			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, nil); err != nil {
