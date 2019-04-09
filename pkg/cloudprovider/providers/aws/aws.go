@@ -766,8 +766,15 @@ func (s *awsSdkEC2) DescribeInstances(request *ec2.DescribeInstancesInput) ([]*e
 	// Instances are paged
 	results := []*ec2.Instance{}
 	var nextToken *string
+	if request.InstanceIds == nil || len(request.InstanceIds) == 0 {
+		pageSize := int64(100)
+		request.MaxResults = &pageSize
+	}
+
 	requestTime := time.Now()
+	i := 0
 	for {
+		i++
 		response, err := s.ec2.DescribeInstances(request)
 		if err != nil {
 			recordAWSMetric("describe_instance", 0, err)
@@ -786,6 +793,7 @@ func (s *awsSdkEC2) DescribeInstances(request *ec2.DescribeInstancesInput) ([]*e
 	}
 	timeTaken := time.Since(requestTime).Seconds()
 	recordAWSMetric("describe_instance", timeTaken, nil)
+	glog.V(2).Infof("DescribeInstance with page size %#v get %d results with %d pages", request.MaxResults, len(results), i)
 	return results, nil
 }
 
