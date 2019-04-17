@@ -198,6 +198,7 @@ func (cache *schedulerCache) AssumePod(pod *v1.Pod) error {
 		return fmt.Errorf("pod %v is in the cache, so can't be assumed", key)
 	}
 
+	glog.V(3).Infof("cache.addPod() called from AssumePod. new pod: %s/%s::%s", pod.Namespace, pod.Name, pod.Spec.NodeName)
 	cache.addPod(pod)
 	ps := &podState{
 		pod: pod,
@@ -248,6 +249,7 @@ func (cache *schedulerCache) ForgetPod(pod *v1.Pod) error {
 	switch {
 	// Only assumed pod can be forgotten.
 	case ok && cache.assumedPods[key]:
+		glog.V(3).Infof("cache.removePod() from ForgetPod: %s/%s", pod.Namespace, pod.Name)
 		err := cache.removePod(pod)
 		if err != nil {
 			return err
@@ -272,6 +274,8 @@ func (cache *schedulerCache) addPod(pod *v1.Pod) {
 
 // Assumes that lock is already acquired.
 func (cache *schedulerCache) updatePod(oldPod, newPod *v1.Pod) error {
+	glog.V(3).Infof("cache.removePod() from cache.updatePod. Old: %s/%s::%s; cache.addPod() New: %s/%s::%s",
+		oldPod.Namespace, oldPod.Name, oldPod.Spec.NodeName, newPod.Namespace, newPod.Name, newPod.Spec.NodeName)
 	if err := cache.removePod(oldPod); err != nil {
 		return err
 	}
@@ -307,6 +311,8 @@ func (cache *schedulerCache) AddPod(pod *v1.Pod) error {
 			// The pod was added to a different node than it was assumed to.
 			glog.Warningf("Pod %v was assumed to be on %v but got added to %v", key, pod.Spec.NodeName, currState.pod.Spec.NodeName)
 			// Clean this up.
+			glog.V(3).Infof("cache.removePod() from AddPod,assumed. cache.addPod() %s/%s::%s; cache.removePod(curPod) %#v",
+			pod.Namespace, pod.Name, pod.Spec.NodeName, currState.pod)
 			cache.removePod(currState.pod)
 			cache.addPod(pod)
 		}
@@ -315,6 +321,7 @@ func (cache *schedulerCache) AddPod(pod *v1.Pod) error {
 		cache.podStates[key].pod = pod
 	case !ok:
 		// Pod was expired. We should add it back.
+		glog.V(3).Infof("cache.addPod() called from AddPod.podExpired. new pod: %s/%s::%s", pod.Namespace, pod.Name, pod.Spec.NodeName)
 		cache.addPod(pod)
 		ps := &podState{
 			pod: pod,
@@ -372,6 +379,7 @@ func (cache *schedulerCache) RemovePod(pod *v1.Pod) error {
 			glog.Errorf("Pod %v was assumed to be on %v but got added to %v", key, pod.Spec.NodeName, currState.pod.Spec.NodeName)
 			glog.Fatalf("Schedulercache is corrupted and can badly affect scheduling decisions")
 		}
+		glog.V(3).Infof("cache.removePod() from RemovePod: %s/%s", pod.Namespace, pod.Name)
 		err := cache.removePod(currState.pod)
 		if err != nil {
 			return err
@@ -596,6 +604,7 @@ func (cache *schedulerCache) cleanupAssumedPods(now time.Time) {
 }
 
 func (cache *schedulerCache) expirePod(key string, ps *podState) error {
+	glog.V(3).Infof("cache.removePod() from expirePod: %s/%s", ps.pod.Namespace, ps.pod.Name)
 	if err := cache.removePod(ps.pod); err != nil {
 		return err
 	}

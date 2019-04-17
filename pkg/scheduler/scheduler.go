@@ -17,6 +17,8 @@ limitations under the License.
 package scheduler
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -225,6 +227,17 @@ func (sched *Scheduler) preempt(preemptor *v1.Pod, scheduleErr error) (string, e
 	}
 
 	node, victims, nominatedPodsToClear, err := sched.config.Algorithm.Preempt(preemptor, sched.config.NodeLister, scheduleErr)
+	vstr := strings.Builder{}
+	nomstr := strings.Builder{}
+
+	for _, v := range victims {
+		vstr.WriteString(fmt.Sprintf("%s/%s, ", v.Namespace, v.Name))
+	}
+
+	for _, nom := range nominatedPodsToClear {
+		nomstr.WriteString(fmt.Sprintf("%s/%s, ", nom.Namespace, nom.Name))
+	}
+
 	metrics.PreemptionVictims.Set(float64(len(victims)))
 	if err != nil {
 		glog.Errorf("Error preempting victims to make room for %v/%v.", preemptor.Namespace, preemptor.Name)
@@ -232,6 +245,9 @@ func (sched *Scheduler) preempt(preemptor *v1.Pod, scheduleErr error) (string, e
 	}
 	var nodeName = ""
 	if node != nil {
+		glog.V(3).Infof("Pod %s/%s gets scheduled on node %s with victims %s and nominated pods to clear %s",
+			preemptor.Namespace, preemptor.Name, node.Name, vstr.String(), nomstr.String())
+
 		nodeName = node.Name
 		err = sched.config.PodPreemptor.SetNominatedNodeName(preemptor, nodeName)
 		if err != nil {
@@ -363,6 +379,10 @@ func (sched *Scheduler) assume(assumed *v1.Pod, host string) error {
 // bind binds a pod to a given node defined in a binding object.  We expect this to run asynchronously, so we
 // handle binding metrics internally.
 func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
+	failed := false
+	defer func() {
+		glog.V(3).Infof("Finished binding pod %s/%s :: %s. Result: %t", assumed.Namespace, assumed.Name, b.Target.Name, failed)
+	}()
 	bindingStart := time.Now()
 	// If binding succeeded then PodScheduled condition will be updated in apiserver so that
 	// it's atomic with setting host.
@@ -382,6 +402,7 @@ func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
 			Status: v1.ConditionFalse,
 			Reason: "BindingRejected",
 		})
+		failed = true
 		return err
 	}
 
@@ -393,6 +414,7 @@ func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
 
 // scheduleOne does the entire scheduling workflow for a single pod.  It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) scheduleOne() {
+	var err error
 	pod := sched.config.NextPod()
 	if pod.DeletionTimestamp != nil {
 		sched.config.Recorder.Eventf(pod, v1.EventTypeWarning, "FailedScheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
@@ -401,6 +423,9 @@ func (sched *Scheduler) scheduleOne() {
 	}
 
 	glog.V(3).Infof("Attempting to schedule pod: %v/%v", pod.Namespace, pod.Name)
+	defer func() {
+		glog.V(3).Infof("Finished Attempting to schedule pod: %v/%v; binding routine started. err: %#v", pod.Namespace, pod.Name, err)
+	}()
 
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
@@ -418,6 +443,8 @@ func (sched *Scheduler) scheduleOne() {
 			metrics.SchedulingLatency.WithLabelValues(metrics.PreemptionEvaluation).Observe(metrics.SinceInSeconds(preemptionStartTime))
 		}
 		return
+	} else {
+		glog.V(3).Infof("Successfully scheduled pod %s/%s to node %s", pod.Namespace, pod.Name, suggestedHost)
 	}
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInMicroseconds(start))
 	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.

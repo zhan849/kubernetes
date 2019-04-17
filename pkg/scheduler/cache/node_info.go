@@ -19,6 +19,7 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -76,6 +77,23 @@ type NodeInfo struct {
 	// Whenever NodeInfo changes, generation is bumped.
 	// This is used to avoid cloning it if the object didn't change.
 	generation int64
+}
+
+
+// DebugStr returns debug string
+func (n *NodeInfo) DebugStr() string {
+	psb := strings.Builder{}
+	for _, p := range n.pods {
+		psb.WriteString(fmt.Sprintf("%s/%s,", p.Namespace, p.Name))
+	}
+
+	paffin := strings.Builder{}
+	for _, p := range n.podsWithAffinity {
+		paffin.WriteString(fmt.Sprintf("%s/%s,", p.Namespace, p.Name))
+	}
+
+	return fmt.Sprintf("Node: %s\nPods: %s\nPodsWithAffinity: %s\nRequestedResource: %#v\nNonZeroRequests: %#v\nAllocable: %#v",
+		n.mustGetNodeName(), psb.String(), paffin.String(), n.requestedResource, n.nonzeroRequest, n.allocatableResource)
 }
 
 //initializeNodeTransientInfo initializes transient information pertaining to node.
@@ -467,10 +485,22 @@ func (n *NodeInfo) AddPod(pod *v1.Pod) {
 	n.updateUsedPorts(pod, true)
 
 	n.generation = nextGeneration()
+	glog.V(3).Infof("Node %s added pod %s/%s. NodeInfo:\n%s\n", n.mustGetNodeName(), pod.Namespace, pod.Name, n.DebugStr())
+}
+
+func (n *NodeInfo) mustGetNodeName() string {
+	if n.node != nil {
+		return n.node.Name
+	}
+	return "nil"
 }
 
 // RemovePod subtracts pod information from this NodeInfo.
 func (n *NodeInfo) RemovePod(pod *v1.Pod) error {
+	defer func() {
+		glog.V(3).Infof("Node %s removed pod %s/%s. NodeInfo:\n%s\n", n.mustGetNodeName(), pod.Namespace, pod.Name, n.DebugStr())
+	}()
+
 	k1, err := getPodKey(pod)
 	if err != nil {
 		return err

@@ -139,6 +139,24 @@ func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister
 	trace.Step("Computing predicates")
 	startPredicateEvalTime := time.Now()
 	filteredNodes, failedPredicateMap, err := g.findNodesThatFit(pod, nodes)
+
+	filtered := strings.Builder{}
+	for _, n := range filteredNodes {
+		filtered.WriteString(n.Name + ";")
+	}
+
+	failed := strings.Builder{}
+    for k, v := range failedPredicateMap {
+		failed.WriteString(k + ":")
+		for _, reason := range v {
+			failed.WriteString(reason.GetReason() + ",")
+		}
+		failed.WriteString("; ")
+	}
+
+    glog.V(3).Infof("Pod: %s/%s FindNodesThatFit: filtered: %s; failedPredicates: %s, Err: %#v",
+    	pod.Namespace, pod.Name, filtered.String(), failed.String(), err)
+
 	if err != nil {
 		return "", err
 	}
@@ -169,8 +187,12 @@ func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister
 	metrics.SchedulingAlgorithmPriorityEvaluationDuration.Observe(metrics.SinceInMicroseconds(startPriorityEvalTime))
 	metrics.SchedulingLatency.WithLabelValues(metrics.PriorityEvaluation).Observe(metrics.SinceInSeconds(startPriorityEvalTime))
 
+	glog.V(3).Infof("Pod: %s/%s after prioritize: %#v", pod.Namespace, pod.Name, priorityList)
 	trace.Step("Selecting host")
-	return g.selectHost(priorityList)
+	node, err := g.selectHost(priorityList)
+
+	glog.V(3).Infof("Pod: %s/%s scheduled onto node %s. NodeInfo:\n%s\n", pod.Namespace, pod.Name, node, g.cachedNodeInfoMap[node].DebugStr())
+	return node, err
 }
 
 // Prioritizers returns a slice containing all the scheduler's priority
@@ -221,6 +243,10 @@ func (g *genericScheduler) selectHost(priorityList schedulerapi.HostPriorityList
 // 3) A list of pods whose nominated node name should be cleared, and 4) any
 // possible error.
 func (g *genericScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister, scheduleErr error) (*v1.Node, []*v1.Pod, []*v1.Pod, error) {
+	glog.V(3).Infof("Preempting Pod %s/%s", pod.Namespace, pod.Name)
+	defer func() {
+		glog.V(3).Infof("Finished Preempting Pod %s/%s", pod.Namespace, pod.Name)
+	}()
 	// Scheduler may return various types of errors. Consider preemption only if
 	// the error is of type FitError.
 	fitError, ok := scheduleErr.(*FitError)
@@ -231,10 +257,13 @@ func (g *genericScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister,
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if !podEligibleToPreemptOthers(pod, g.cachedNodeInfoMap) {
-		glog.V(5).Infof("Pod %v/%v is not eligible for more preemption.", pod.Namespace, pod.Name)
+	ok, reason := podEligibleToPreemptOthers(pod, g.cachedNodeInfoMap)
+	if !ok {
+		glog.V(3).Infof("Pod %v/%v is not eligible for more preemption: %s", pod.Namespace, pod.Name, reason)
 		return nil, nil, nil, nil
 	}
+	glog.V(3).Infof("Pod %v/%v can preempt: %s", pod.Namespace, pod.Name, reason)
+
 	allNodes, err := nodeLister.List()
 	if err != nil {
 		return nil, nil, nil, err
@@ -242,7 +271,7 @@ func (g *genericScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister,
 	if len(allNodes) == 0 {
 		return nil, nil, nil, ErrNoNodesAvailable
 	}
-	potentialNodes := nodesWherePreemptionMightHelp(allNodes, fitError.FailedPredicates)
+	potentialNodes := nodesWherePreemptionMightHelp(allNodes, fitError.FailedPredicates, fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 	if len(potentialNodes) == 0 {
 		glog.V(3).Infof("Preemption will not help schedule pod %v/%v on any node.", pod.Namespace, pod.Name)
 		// In this case, we should clean-up any existing nominated node name of the pod.
@@ -265,6 +294,16 @@ func (g *genericScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister,
 	if err != nil {
 		return nil, nil, nil, err
 	}
+
+	sb := strings.Builder{}
+	for n, v := range nodeToVictims {
+		psb := strings.Builder{}
+		for _, p := range v.Pods {
+			psb.WriteString(fmt.Sprintf("%s/%s;", p.Namespace, p.Name))
+		}
+		sb.WriteString(fmt.Sprintf("%s:%s / ", n.Name, psb.String()))
+	}
+	glog.V(3).Infof("Processed possible preempts for %s/%s: %s", pod.Namespace, pod.Name, sb.String())
 
 	candidateNode := pickOneNodeForPreemption(nodeToVictims)
 	if candidateNode == nil {
@@ -886,6 +925,13 @@ func selectNodesForPreemption(pod *v1.Pod,
 			metaCopy = meta.ShallowCopy()
 		}
 		pods, numPDBViolations, fits := selectVictimsOnNode(pod, metaCopy, nodeNameToInfo[nodeName], predicates, queue, pdbs)
+
+		sb := strings.Builder{}
+		for _, p := range pods {
+			sb.WriteString(fmt.Sprintf("%s/%s, ", p.Namespace, p.Name))
+		}
+
+		glog.V(3).Infof("Pod %s/%s: Node %s fits (%t) by preempting %s", pod.Namespace, pod.Name, nodeName, fits, sb.String())
 		if fits {
 			resultLock.Lock()
 			victims := schedulerapi.Victims{
@@ -1028,7 +1074,7 @@ func selectVictimsOnNode(
 
 // nodesWherePreemptionMightHelp returns a list of nodes with failed predicates
 // that may be satisfied by removing pods from the node.
-func nodesWherePreemptionMightHelp(nodes []*v1.Node, failedPredicatesMap FailedPredicateMap) []*v1.Node {
+func nodesWherePreemptionMightHelp(nodes []*v1.Node, failedPredicatesMap FailedPredicateMap, pod string) []*v1.Node {
 	potentialNodes := []*v1.Node{}
 	for _, node := range nodes {
 		unresolvableReasonExist := false
@@ -1065,8 +1111,10 @@ func nodesWherePreemptionMightHelp(nodes []*v1.Node, failedPredicatesMap FailedP
 			}
 		}
 		if !found || !unresolvableReasonExist {
-			glog.V(3).Infof("Node %v is a potential node for preemption.", node.Name)
+			glog.V(3).Infof("Pod %s: Node %v is a potential node for preemption, failed predicates: %#v", pod, node.Name, failedPredicates)
 			potentialNodes = append(potentialNodes, node)
+		} else {
+			glog.V(3).Infof("Pod %s: Node %v is not suitable for preemption. Found: %t, failed predicates: %#v", pod, node.Name, found, failedPredicates)
 		}
 	}
 	return potentialNodes
@@ -1078,19 +1126,29 @@ func nodesWherePreemptionMightHelp(nodes []*v1.Node, failedPredicatesMap FailedP
 // considered for preemption.
 // We look at the node that is nominated for this pod and as long as there are
 // terminating pods on the node, we don't consider this for preempting more pods.
-func podEligibleToPreemptOthers(pod *v1.Pod, nodeNameToInfo map[string]*schedulercache.NodeInfo) bool {
+func podEligibleToPreemptOthers(pod *v1.Pod, nodeNameToInfo map[string]*schedulercache.NodeInfo) (bool, string) {
 	nomNodeName := pod.Status.NominatedNodeName
+	reason := strings.Builder{}
 	if len(nomNodeName) > 0 {
+		reason.WriteString(fmt.Sprintf("NomNode:%s", nomNodeName))
 		if nodeInfo, found := nodeNameToInfo[nomNodeName]; found {
 			for _, p := range nodeInfo.Pods() {
 				if p.DeletionTimestamp != nil && util.GetPodPriority(p) < util.GetPodPriority(pod) {
+					reason.WriteString(fmt.Sprintf("NodePodDelTs:%s,NodePodPri:%d,PendingPodPri:%d / ",
+						p.DeletionTimestamp, util.GetPodPriority(p), util.GetPodPriority(pod)))
 					// There is a terminating pod on the nominated node.
-					return false
+					return false, reason.String()
 				}
+				reason.WriteString(fmt.Sprintf("NodePodPri:%d,PendingPodPri:%d / ",
+					util.GetPodPriority(p), util.GetPodPriority(pod)))
 			}
+		} else {
+			reason.WriteString(fmt.Sprintf("NoNodeInfo:%s / ", nomNodeName))
 		}
+	} else {
+		reason.WriteString("NoNominatedNode / ")
 	}
-	return true
+	return true, reason.String()
 }
 
 // podPassesBasicChecks makes sanity checks on the pod if it can be scheduled.
