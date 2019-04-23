@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/kubernetes/pkg/util/system"
 	"net"
 	"strconv"
 	"strings"
@@ -57,6 +58,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/kubernetes/pkg/api/v1/node"
 	"k8s.io/kubernetes/pkg/api/v1/service"
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/controller"
@@ -1451,48 +1453,27 @@ func (c *Cloud) InstanceType(ctx context.Context, nodeName types.NodeName) (stri
 	return aws.StringValue(inst.InstanceType), nil
 }
 
-// GetCandidateZonesForDynamicVolume retrieves  a list of all the zones in which nodes are running
-// It currently involves querying all instances
+// GetCandidateZonesForDynamicVolume retrieves a list of all the zones in which nodes are running
+// It currently involves querying all instances from api server
 func (c *Cloud) GetCandidateZonesForDynamicVolume() (sets.String, error) {
-	// We don't currently cache this; it is currently used only in volume
-	// creation which is expected to be a comparatively rare occurrence.
-
-	// TODO: Caching / expose v1.Nodes to the cloud provider?
-	// TODO: We could also query for subnets, I think
-
-	filters := []*ec2.Filter{newEc2Filter("instance-state-name", "running")}
-
-	instances, err := c.describeInstances(filters)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(instances) == 0 {
-		return nil, fmt.Errorf("no instances returned")
-	}
-
 	zones := sets.NewString()
-
-	for _, instance := range instances {
-		// We skip over master nodes, if the installation tool labels them with one of the well-known master labels
-		// This avoids creating a volume in a zone where only the master is running - e.g. #34583
-		// This is a short-term workaround until the scheduler takes care of zone selection
-		master := false
-		for _, tag := range instance.Tags {
-			tagKey := aws.StringValue(tag.Key)
-			if awsTagNameMasterRoles.Has(tagKey) {
-				master = true
+	// TODO: list from cache?
+	if nodes, err := c.kubeClient.CoreV1().Nodes().List(metav1.ListOptions{}); err != nil {
+		glog.Errorf("Failed to get nodes from api server: %#v", err)
+		return nil, err
+	} else {
+		for _, n := range nodes.Items {
+			if hostname, ok := n.Labels[kubeletapis.LabelHostname]; ok && system.IsMasterNode(hostname) {
+				glog.V(4).Infof("Ignoring master node %q in zone discovery", n.Name)
+			} else if node.IsNodeReady(&n) {
+				if zone, ok := n.Labels[kubeletapis.LabelZoneFailureDomain]; ok {
+					zones.Insert(zone)
+				} else {
+					glog.Warningf("Node %s does not have zone label, ignore for zone discovery.", n.Name)
+				}
+			} else {
+				glog.V(4).Infof("Ignoring not ready minion node %q in zone discovery", n.Name)
 			}
-		}
-
-		if master {
-			glog.V(4).Infof("Ignoring master instance %q in zone discovery", aws.StringValue(instance.InstanceId))
-			continue
-		}
-
-		if instance.Placement != nil {
-			zone := aws.StringValue(instance.Placement.AvailabilityZone)
-			zones.Insert(zone)
 		}
 	}
 
