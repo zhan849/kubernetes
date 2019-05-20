@@ -208,6 +208,27 @@ func GetContainerStatus(statuses []v1.ContainerStatus, name string) (v1.Containe
 	return v1.ContainerStatus{}, false
 }
 
+// IsOneOffPod determines if a pod is run-to-finish
+func IsOneOffPod(pod *v1.Pod) bool {
+	for _, oRef := range pod.OwnerReferences {
+		// Use more strict checking to avoid false positive
+		if oRef.Kind == "TFJob" || oRef.Kind == "PyTorchJob" || oRef.Kind == "Job" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSideCar determines if a container is marked as sidecar container in pinterest
+func IsSideCar(container *v1.Container) bool {
+	for _, envVar := range container.Env {
+		if envVar.Name == "IS_SIDE_CAR" && envVar.Value == "true" {
+			return true
+		}
+	}
+	return false
+}
+
 // GetExistingContainerStatus extracts the status of container "name" from "statuses",
 // It also returns if "name" exists.
 func GetExistingContainerStatus(statuses []v1.ContainerStatus, name string) v1.ContainerStatus {

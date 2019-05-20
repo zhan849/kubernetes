@@ -1212,7 +1212,8 @@ func (kl *Kubelet) GetKubeletContainerLogs(ctx context.Context, podFullName, con
 }
 
 // getPhase returns the phase of a pod given its container info.
-func getPhase(spec *v1.PodSpec, info []v1.ContainerStatus) v1.PodPhase {
+func getPhase(pod *v1.Pod, info []v1.ContainerStatus) v1.PodPhase {
+	spec := &pod.Spec
 	initialized := 0
 	pendingInitialization := 0
 	failedInitialization := 0
@@ -1292,6 +1293,27 @@ func getPhase(spec *v1.PodSpec, info []v1.ContainerStatus) v1.PodPhase {
 		glog.V(5).Infof("pod waiting > 0, pending")
 		// One or more containers has not been started
 		return v1.PodPending
+	case podutil.IsOneOffPod(pod):
+		// this logic can be combined to above and be more efficient
+		// but since this is a patched logic, I'd prefer to keep it
+		// local
+		allMainSuccess, allTerminated, hasUnknown := getOneOffPodContainerStatus(&pod.Spec, info)
+		if hasUnknown {
+			return v1.PodPending
+		}
+		if !allTerminated {
+			return v1.PodRunning
+		}
+		if !allMainSuccess {
+			// all done but not all main containers succeeded
+			if pod.Spec.RestartPolicy == v1.RestartPolicyNever {
+				return v1.PodFailed
+			} else {
+				return v1.PodRunning
+			}
+		}
+		// all terminated, all main containers succeeded, we don't care about side car status
+		return v1.PodSucceeded
 	case running > 0 && unknown == 0:
 		// All containers have been started, and at least
 		// one container is running
@@ -1321,6 +1343,33 @@ func getPhase(spec *v1.PodSpec, info []v1.ContainerStatus) v1.PodPhase {
 	}
 }
 
+func getOneOffPodContainerStatus(spec *v1.PodSpec, info []v1.ContainerStatus) (allMainSuccess bool, allTerminated bool, hasUnknown bool) {
+	allMainSuccess = true
+	allTerminated = true
+	hasUnknown = false
+
+	for _, c := range spec.Containers {
+		containerStatus, ok := podutil.GetContainerStatus(info, c.Name)
+		if !ok {
+			// container containerStatus unknown
+			hasUnknown = true
+		}
+
+		if containerStatus.State.Waiting != nil || containerStatus.State.Running != nil {
+			allTerminated = false
+		}
+
+		if !podutil.IsSideCar(&c) {
+			// main container
+			if containerStatus.State.Terminated != nil && containerStatus.State.Terminated.ExitCode != 0 {
+				allMainSuccess = false
+			}
+		}
+
+	}
+	return allMainSuccess, allTerminated, hasUnknown
+}
+
 // generateAPIPodStatus creates the final API pod status for a pod, given the
 // internal pod status.
 func (kl *Kubelet) generateAPIPodStatus(pod *v1.Pod, podStatus *kubecontainer.PodStatus) v1.PodStatus {
@@ -1342,7 +1391,7 @@ func (kl *Kubelet) generateAPIPodStatus(pod *v1.Pod, podStatus *kubecontainer.Po
 	// Assume info is ready to process
 	spec := &pod.Spec
 	allStatus := append(append([]v1.ContainerStatus{}, s.ContainerStatuses...), s.InitContainerStatuses...)
-	s.Phase = getPhase(spec, allStatus)
+	s.Phase = getPhase(pod, allStatus)
 	// Check for illegal phase transition
 	if pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded {
 		// API server shows terminal phase; transitions are not allowed

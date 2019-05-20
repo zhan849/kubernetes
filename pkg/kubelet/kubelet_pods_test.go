@@ -1467,7 +1467,7 @@ func TestPodPhaseWithRestartAlways(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(test.pod, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
@@ -1478,6 +1478,15 @@ func TestPodPhaseWithRestartNever(t *testing.T) {
 		Containers: []v1.Container{
 			{Name: "containerA"},
 			{Name: "containerB"},
+		},
+		RestartPolicy: v1.RestartPolicyNever,
+	}
+
+	desiredStateWithSidecar := v1.PodSpec{
+		NodeName: "machine",
+		Containers: []v1.Container{
+			{Name: "containerA"},
+			{Name: "containerB", Env: []v1.EnvVar{{Name: "IS_SIDE_CAR", Value: "true"}}},
 		},
 		RestartPolicy: v1.RestartPolicyNever,
 	}
@@ -1565,9 +1574,135 @@ func TestPodPhaseWithRestartNever(t *testing.T) {
 			v1.PodPending,
 			"mixed state #3 with restart never",
 		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerA"),
+						failedState("containerB"),
+					},
+				},
+			},
+			v1.PodSucceeded,
+			"one off container main success sidecar fail",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerA"),
+						runningState("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"one off container main success sidecar running",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						failedState("containerA"),
+						runningState("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"one off container main fail sidecar running",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerA"),
+						failedState("containerB"),
+					},
+				},
+			},
+			v1.PodSucceeded,
+			"one off container main success sidecar exit",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						failedState("containerA"),
+						failedState("containerB"),
+					},
+				},
+			},
+			v1.PodFailed,
+			"one off container all fail",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredStateWithSidecar,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerA"),
+						succeededState("containerB"),
+					},
+				},
+			},
+			v1.PodSucceeded,
+			"one off container all success",
+		},
 	}
 	for _, test := range tests {
-		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(test.pod, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
@@ -1577,7 +1712,7 @@ func TestPodPhaseWithRestartOnFailure(t *testing.T) {
 		NodeName: "machine",
 		Containers: []v1.Container{
 			{Name: "containerA"},
-			{Name: "containerB"},
+			{Name: "containerB", Env: []v1.EnvVar{{Name: "IS_SIDE_CAR", Value: "true"}}},
 		},
 		RestartPolicy: v1.RestartPolicyOnFailure,
 	}
@@ -1678,9 +1813,114 @@ func TestPodPhaseWithRestartOnFailure(t *testing.T) {
 			v1.PodRunning,
 			"backoff crashloop container with restart onfailure",
 		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						runningState("containerA"),
+						waitingStateWithLastTermination("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"sidecar crash, main running",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						failedState("containerA"),
+						runningState("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"main crash, sidecar running",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						failedState("containerA"),
+						failedState("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"main crash, sidecar crash",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						waitingStateWithLastTermination("containerA"),
+						failedState("containerB"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"main waiting, sidecar crash",
+		},
+		{
+			&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind:       "Job",
+							APIVersion: "batch/v1",
+						},
+					},
+				},
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerA"),
+						succeededState("containerB"),
+					},
+				},
+			},
+			v1.PodSucceeded,
+			"main succeeded, sidecar succeeded",
+		},
 	}
 	for _, test := range tests {
-		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(test.pod, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
