@@ -312,6 +312,77 @@ func checkContainerStateTransition(oldStatuses, newStatuses []v1.ContainerStatus
 	return nil
 }
 
+// checkOneOffPodContainterStateTransition validates container state transitions for one-off pods
+// this function assumes the pod is one-off
+func checkOneOffPodContainterStateTransition(pod *v1.Pod, oldStatuses []v1.ContainerStatus) error {
+	// one-off pod theoretically does not make sense with RestartPolicyAlways, but since there are
+	// some applications that don't validate such setting, we should still support this case at
+	// kubelet level
+	if pod.Spec.RestartPolicy == v1.RestartPolicyAlways {
+		return nil
+	}
+
+	mainMap := map[string]bool{}
+	for _, c := range pod.Spec.Containers {
+		if !podutil.IsSideCar(&c) {
+			mainMap[c.Name] = true
+		}
+	}
+
+	newStatusMap := map[string]*v1.ContainerStatus{}
+	for i := range pod.Status.ContainerStatuses {
+		s := pod.Status.ContainerStatuses[i]
+		newStatusMap[s.Name] = &s
+	}
+
+	allMainFinished := true
+	for _, c := range oldStatuses {
+		if _, ok := mainMap[c.Name]; ok {
+			// main container
+			if !isMainContainerInOneOffPodFinished(&c, pod.Spec.RestartPolicy) {
+				allMainFinished = false
+				break
+			}
+		}
+	}
+
+	for _, oldStatus := range oldStatuses {
+		newStatus, ok := newStatusMap[oldStatus.Name]
+		if !ok {
+			// As for kubelet, pod spec can change and kubelet tolerates container addition/removal in pod spec
+			// we should let it proceed here
+			klog.Warningf("Unable to find new container status for container %s in pod %s. Details: %#v", oldStatus.Name, format.Pod(pod), pod.Status)
+			continue
+		}
+
+		if _, ok := mainMap[oldStatus.Name]; ok {
+			// main container should not transit to non-terminate state when it should not be restarted
+			if isMainContainerInOneOffPodFinished(&oldStatus, pod.Spec.RestartPolicy) && newStatus.State.Terminated == nil {
+				return fmt.Errorf("main container %s for pod %s is finished but is requested to be transfered to non-terminated state. Waiting: %#v; Running: %#v",
+					newStatus.Name, format.Pod(pod), newStatus.State.Waiting, newStatus.State.Running)
+			}
+		} else {
+			// sidecar does not stick to restart policy, but there could be race condition when sidecar is
+			// in crash loop back off while main containers are finished, and the pod is marked to be gracefully deleted,
+			// we should not return error here and block main podSyncLoop, but to let main pod sync loop to clean up things eventually
+			if allMainFinished && oldStatus.State.Terminated != nil && newStatus.State.Terminated == nil {
+				klog.Warningf("Sidecar %s for pod %s should not be restarted but is requested non-terminated state, needs further reconciliation. Waiting: %#v; Running %#v.",
+					newStatus.Name, format.Pod(pod), newStatus.State.Waiting, newStatus.State.Running)
+			}
+		}
+	}
+	return nil
+}
+
+// isMainContainerInOneOffPodFinished checks if a main container in a one off pod is exited (terminated) and will
+// never be brought back again. This assume the status is for main container in an one-off pod
+func isMainContainerInOneOffPodFinished(status *v1.ContainerStatus, policy v1.RestartPolicy) bool {
+	if status.State.Terminated == nil || policy == v1.RestartPolicyAlways {
+		return false
+	}
+	return status.State.Terminated.ExitCode == 0 || policy == v1.RestartPolicyNever
+}
+
 // updateStatusInternal updates the internal status cache, and queues an update to the api server if
 // necessary. Returns whether an update was triggered.
 // This method IS NOT THREAD SAFE and must be called from a locked function.
@@ -327,10 +398,19 @@ func (m *manager) updateStatusInternal(pod *v1.Pod, status v1.PodStatus, forceUp
 	}
 
 	// Check for illegal state transition in containers
-	if err := checkContainerStateTransition(oldStatus.ContainerStatuses, status.ContainerStatuses, pod.Spec.RestartPolicy); err != nil {
-		klog.Errorf("Status update on pod %v/%v aborted: %v", pod.Namespace, pod.Name, err)
-		return false
+	if podutil.IsOneOffPod(pod) {
+		// we have to branch off here as sidecar containers in one-off pod does not strictly comply to pod restart policy
+		if err := checkOneOffPodContainterStateTransition(pod, oldStatus.ContainerStatuses); err != nil {
+			klog.Errorf("Status update on pod %v/%v aborted: %v", pod.Namespace, pod.Name, err)
+			return false
+		}
+	} else {
+		if err := checkContainerStateTransition(oldStatus.ContainerStatuses, status.ContainerStatuses, pod.Spec.RestartPolicy); err != nil {
+			klog.Errorf("Status update on pod %v/%v aborted: %v", pod.Namespace, pod.Name, err)
+			return false
+		}
 	}
+
 	if err := checkContainerStateTransition(oldStatus.InitContainerStatuses, status.InitContainerStatuses, pod.Spec.RestartPolicy); err != nil {
 		klog.Errorf("Status update on pod %v/%v aborted: %v", pod.Namespace, pod.Name, err)
 		return false
