@@ -201,6 +201,24 @@ func visitContainerConfigmapNames(container *v1.Container, visitor Visitor) bool
 	return true
 }
 
+// IsOneOffPod determines if a pod is run-to-finish, this applied specifically to Pinterest
+func IsOneOffPod(pod *v1.Pod) bool {
+	// current sidecar impl shall work for both "OnFailre" and "Never" restart policy.
+	// k8s api server validation controller enforces ReplicaSet/StatefulSet to only
+	// have "Always" as restart policy
+	return pod.Spec.RestartPolicy != v1.RestartPolicyAlways
+}
+
+// IsSideCar determines if a container is marked as sidecar container in Pinterest
+func IsSideCar(container *v1.Container) bool {
+	for _, envVar := range container.Env {
+		if envVar.Name == "IS_SIDE_CAR" && envVar.Value == "true" {
+			return true
+		}
+	}
+	return false
+}
+
 // GetContainerStatus extracts the status of container "name" from "statuses".
 // It also returns if "name" exists.
 func GetContainerStatus(statuses []v1.ContainerStatus, name string) (v1.ContainerStatus, bool) {
