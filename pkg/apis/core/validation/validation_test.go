@@ -8651,6 +8651,246 @@ func TestValidatePodStatusUpdate(t *testing.T) {
 			"",
 			"Update nominatedNodeName",
 		},
+		{
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyNever,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Waiting: &core.ContainerStateWaiting{},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{},
+							},
+						},
+					},
+				},
+			},
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyNever,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{
+									ExitCode: 0,
+								},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{},
+							},
+						},
+					},
+				},
+			},
+			"",
+			"Update sidecar status for restartPolicy=Never pod",
+		},
+		{
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyOnFailure,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+						{
+							Name: "main",
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Running: &core.ContainerStateRunning{},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{},
+							},
+						},
+					},
+				},
+			},
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyOnFailure,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+						{
+							Name: "main",
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{
+									ExitCode: 0,
+								},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{},
+							},
+						},
+					},
+				},
+			},
+			"",
+			"Update sidecar status for restartPolicy=OnFailure pod",
+		},
+		{
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyNever,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+						{
+							Name: "main",
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Running: &core.ContainerStateRunning{},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Waiting: &core.ContainerStateWaiting{},
+							},
+						},
+					},
+				},
+			},
+			core.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+				},
+				Spec: core.PodSpec{
+					RestartPolicy: core.RestartPolicyNever,
+					Containers: []core.Container{
+						{
+							Name: "sidecar",
+							Env: []core.EnvVar{
+								{
+									Name: "IS_SIDE_CAR",
+									Value: "true",
+								},
+							},
+						},
+						{
+							Name: "main",
+						},
+					},
+				},
+				Status: core.PodStatus{
+					ContainerStatuses: []core.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: core.ContainerState{
+								Running: &core.ContainerStateRunning{},
+							},
+						},
+						{
+							Name: "main",
+							State: core.ContainerState{
+								Terminated: &core.ContainerStateTerminated{
+									ExitCode: 0,
+								},
+							},
+						},
+					},
+				},
+			},
+			"Forbidden",
+			"Update sidecar status for restartPolicy=Never pod, main container has violation",
+		},
 	}
 
 	for _, test := range tests {

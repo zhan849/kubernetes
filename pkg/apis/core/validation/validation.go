@@ -3559,6 +3559,59 @@ func ValidateContainerStateTransition(newStatuses, oldStatuses []core.ContainerS
 	return allErrs
 }
 
+// doValidateContainerStateTransitionForOneOffPod checks for any illegal container state transition that are being attempted
+// this function complies with Pinterest's specific sidecar support, and has same logic as ValidateContainerStateTransition
+// but treat sidecar containers as always restart disregarding pod's restart policy
+func doValidateContainerStateTransitionForOneOffPod(pod *core.Pod, newStatuses, oldStatuses []core.ContainerStatus, fldpath *field.Path, restartPolicy core.RestartPolicy) field.ErrorList {
+	isSidecarFunc := func(name string) bool {
+		// init container shall not be "sidecar"
+		for _, c := range pod.Spec.Containers {
+			if c.Name == name {
+				for _, env := range c.Env {
+					if env.Name == "IS_SIDE_CAR" && env.Value == "true" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	allErrs := field.ErrorList{}
+
+	// If we should always restart, containers are allowed to leave the terminated state
+	if restartPolicy == core.RestartPolicyAlways {
+		return allErrs
+	}
+	for i, oldStatus := range oldStatuses {
+		// skip for sidecar as sidecar will always be restartable
+		if isSidecarFunc(oldStatus.Name) {
+			continue
+		}
+		// Skip any container that is not terminated
+		if oldStatus.State.Terminated == nil {
+			continue
+		}
+		// Skip any container that failed but is allowed to restart
+		if oldStatus.State.Terminated.ExitCode != 0 && restartPolicy == core.RestartPolicyOnFailure {
+			continue
+		}
+		for _, newStatus := range newStatuses {
+			if oldStatus.Name == newStatus.Name && newStatus.State.Terminated == nil {
+				allErrs = append(allErrs, field.Forbidden(fldpath.Index(i).Child("state"), "may not be transitioned to non-terminated state"))
+			}
+		}
+	}
+	return allErrs
+}
+
+// isOneOffPod tests if the pod is one off - this is copied from pkg/api/v1/pod/util.go, to keep sidecar change local
+// and to avoid unintended cross-package dependency for in-house solutino. This specific to Pinterest's in house sidecar
+// solution.
+func isOneOffPod(pod *core.Pod) bool {
+	return pod.Spec.RestartPolicy != core.RestartPolicyAlways
+}
+
 // ValidatePodStatusUpdate tests to see if the update is legal for an end user to make. newPod is updated with fields
 // that cannot be changed.
 func ValidatePodStatusUpdate(newPod, oldPod *core.Pod) field.ErrorList {
@@ -3580,7 +3633,11 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod) field.ErrorList {
 
 	// If pod should not restart, make sure the status update does not transition
 	// any terminated containers to a non-terminated state.
-	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec.RestartPolicy)...)
+	if isOneOffPod(oldPod) {
+		allErrs = append(allErrs, doValidateContainerStateTransitionForOneOffPod(oldPod, newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec.RestartPolicy)...)
+	} else {
+		allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec.RestartPolicy)...)
+	}
 	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), oldPod.Spec.RestartPolicy)...)
 
 	// For status update we ignore changes to pod spec.
