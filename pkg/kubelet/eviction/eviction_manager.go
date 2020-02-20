@@ -384,7 +384,7 @@ func (m *managerImpl) synchronize(diskInfoProvider DiskInfoProvider, podFunc Act
 		}
 		message, annotations := evictionMessage(resourceToReclaim, pod, statsFunc)
 		if m.evictPod(pod, gracePeriodOverride, message, annotations) {
-			metrics.Evictions.WithLabelValues(string(thresholdToReclaim.Signal)).Inc()
+			metrics.Evictions.WithLabelValues(string(thresholdToReclaim.Signal), pod.Namespace).Inc()
 			return []*v1.Pod{pod}
 		}
 	}

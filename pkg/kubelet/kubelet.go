@@ -38,7 +38,7 @@ import (
 	"k8s.io/utils/mount"
 	utilnet "k8s.io/utils/net"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -55,7 +55,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/certificate"
 	"k8s.io/client-go/util/flowcontrol"
-	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/cloud-provider"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	"k8s.io/klog"
 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
@@ -1517,7 +1517,7 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 		if !firstSeenTime.IsZero() {
 			// This is the first time we are syncing the pod. Record the latency
 			// since kubelet first saw the pod if firstSeenTime is set.
-			metrics.PodWorkerStartDuration.Observe(metrics.SinceInSeconds(firstSeenTime))
+			metrics.PodWorkerStartDuration.WithLabelValues(pod.Namespace).Observe(metrics.SinceInSeconds(firstSeenTime))
 		} else {
 			klog.V(3).Infof("First seen time not recorded for pod %q", pod.UID)
 		}
@@ -1541,7 +1541,10 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 	existingStatus, ok := kl.statusManager.GetPodStatus(pod.UID)
 	if !ok || existingStatus.Phase == v1.PodPending && apiPodStatus.Phase == v1.PodRunning &&
 		!firstSeenTime.IsZero() {
-		metrics.PodStartDuration.Observe(metrics.SinceInSeconds(firstSeenTime))
+		if !pod.CreationTimestamp.IsZero() {
+			metrics.PodStartE2EDuration.WithLabelValues(pod.Namespace).Observe(metrics.SinceInSeconds(pod.CreationTimestamp.Time))
+		}
+		metrics.PodStartDuration.WithLabelValues(pod.Namespace).Observe(metrics.SinceInSeconds(firstSeenTime))
 	}
 
 	runnable := kl.canRunPod(pod)
@@ -2026,7 +2029,7 @@ func (kl *Kubelet) dispatchWork(pod *v1.Pod, syncType kubetypes.SyncPodType, mir
 	})
 	// Note the number of containers for new pods.
 	if syncType == kubetypes.SyncPodCreate {
-		metrics.ContainersPerPodCount.Observe(float64(len(pod.Spec.Containers)))
+		metrics.ContainersPerPodCount.WithLabelValues(pod.Namespace).Observe(float64(len(pod.Spec.Containers)))
 	}
 }
 

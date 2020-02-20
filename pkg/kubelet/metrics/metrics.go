@@ -41,6 +41,7 @@ const (
 	PodStartDurationKey          = "pod_start_duration_seconds"
 	CgroupManagerOperationsKey   = "cgroup_manager_duration_seconds"
 	PodWorkerStartDurationKey    = "pod_worker_start_duration_seconds"
+	PodWorkerStartE2EDurationKey = "pod_worker_start_e2e_duration_seconds"
 	PLEGRelistDurationKey        = "pleg_relist_duration_seconds"
 	PLEGDiscardEventsKey         = "pleg_discard_events"
 	PLEGRelistIntervalKey        = "pleg_relist_interval_seconds"
@@ -76,9 +77,16 @@ const (
 	// Metrics keys for RuntimeClass
 	RunPodSandboxDurationKey = "run_podsandbox_duration_seconds"
 	RunPodSandboxErrorsKey   = "run_podsandbox_errors_total"
+	ImagePullDurationKey     = "image_pull_duration_seconds_key"
+	ImageCacheHitCountKey    = "image_cache_hit_count_key"
+	ImageEnsureCountKey      = "image_ensure_count_key"
 )
 
 var (
+	// podLatencyBuckets is a default bucket for pod related observations that can vary from seconds to minutes level,
+	// such as pod startup, image pulling, etc
+	podLatencyBuckets = []float64{1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0}
+
 	// NodeName is a Gauge that tracks the ode's name. The count is always 1.
 	NodeName = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
@@ -90,14 +98,15 @@ var (
 		[]string{NodeLabelKey},
 	)
 	// ContainersPerPodCount is a Counter that tracks the number of containers per pod.
-	ContainersPerPodCount = metrics.NewHistogram(
+	ContainersPerPodCount = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      KubeletSubsystem,
 			Name:           "containers_per_pod_count",
 			Help:           "The number of containers per pod.",
-			Buckets:        metrics.DefBuckets,
+			Buckets:        metrics.LinearBuckets(1, 1, 10),
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"namespace"},
 	)
 	// PodWorkerDuration is a Histogram that tracks the duration (in seconds) in takes to sync a single pod.
 	// Broken down by the operation type.
@@ -106,20 +115,33 @@ var (
 			Subsystem:      KubeletSubsystem,
 			Name:           PodWorkerDurationKey,
 			Help:           "Duration in seconds to sync a single pod. Broken down by operation type: create, update, or sync",
-			Buckets:        metrics.DefBuckets,
+			Buckets:        podLatencyBuckets,
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"operation_type"},
 	)
 	// PodStartDuration is a Histogram that tracks the duration (in seconds) it takes for a single pod to go from pending to running.
-	PodStartDuration = metrics.NewHistogram(
+	PodStartDuration = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      KubeletSubsystem,
 			Name:           PodStartDurationKey,
 			Help:           "Duration in seconds for a single pod to go from pending to running.",
-			Buckets:        metrics.DefBuckets,
+			Buckets:        podLatencyBuckets,
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"namespace"},
+	)
+
+	// PodStartE2EDuration is a histogram that tracks duration in seconds for a single pod to go from created to running
+	PodStartE2EDuration = metrics.NewHistogramVec(
+		&metrics.HistogramOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           PodWorkerStartE2EDurationKey,
+			Help:           "Duration in seconds for a single pod to go from created to running",
+			Buckets:        podLatencyBuckets,
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"namespace"},
 	)
 	// CgroupManagerDuration is a Histogram that tracks the duration (in seconds) it takes for cgroup manager operations to complete.
 	// Broken down by method.
@@ -134,7 +156,7 @@ var (
 		[]string{"operation_type"},
 	)
 	// PodWorkerStartDuration is a Histogram that tracks the duration (in seconds) it takes from seeing a pod to starting a worker.
-	PodWorkerStartDuration = metrics.NewHistogram(
+	PodWorkerStartDuration = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      KubeletSubsystem,
 			Name:           PodWorkerStartDurationKey,
@@ -142,6 +164,7 @@ var (
 			Buckets:        metrics.DefBuckets,
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"namespace"},
 	)
 	// PLEGRelistDuration is a Histogram that tracks the duration (in seconds) it takes for relisting pods in the Kubelet's
 	// Pod Lifecycle Event Generator (PLEG).
@@ -219,8 +242,47 @@ var (
 		},
 		[]string{"operation_type"},
 	)
+
+	// RuntimeImagePullDuration is a Histogram that tracks the duration (in seconds) for image pull,
+	// broken down by image
+	RuntimeImagePullDuration = metrics.NewHistogramVec(
+		&metrics.HistogramOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           ImagePullDurationKey,
+			Help:           "Cumulative number of image pull duration by image spec",
+			Buckets:        podLatencyBuckets,
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"image"},
+	)
+
+	// RuntimeImagePullCount is a Counter that tracks kubelet's attempt to ensure image,
+	// broken by image. Two cases are excluded: 1) image not present AND image pull policy is NEVER;
+	// 2) image shall be pulled but should backoff
+	RuntimeImagePullCount = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           ImageEnsureCountKey,
+			Help:           "Cumulative number of ensure image attempts",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"image"},
+	)
+
+	// RuntimeImagePullCacheHitCount is a Counter that tracks kubelet's attempt to ensure image,
+	// broken by image
+	RuntimeImagePullCacheHitCount = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           ImageCacheHitCountKey,
+			Help:           "Cumulative number of ensure image with local cache hit",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"image"},
+	)
+
 	// Evictions is a Counter that tracks the cumulative number of pod evictions initiated by the kubelet.
-	// Broken down by eviction signal.
+	// Broken down by eviction signal and pod namespace.
 	Evictions = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Subsystem:      KubeletSubsystem,
@@ -228,7 +290,7 @@ var (
 			Help:           "Cumulative number of pod evictions by eviction signal",
 			StabilityLevel: metrics.ALPHA,
 		},
-		[]string{"eviction_signal"},
+		[]string{"eviction_signal", "namespace"},
 	)
 	// EvictionStatsAge is a Histogram that tracks the time (in seconds) between when stats are collected and when a pod is evicted
 	// based on those stats. Broken down by eviction signal.
@@ -375,6 +437,7 @@ func Register(containerCache kubecontainer.RuntimeCache, collectors ...metrics.S
 		legacyregistry.MustRegister(NodeName)
 		legacyregistry.MustRegister(PodWorkerDuration)
 		legacyregistry.MustRegister(PodStartDuration)
+		legacyregistry.MustRegister(PodStartE2EDuration)
 		legacyregistry.MustRegister(CgroupManagerDuration)
 		legacyregistry.MustRegister(PodWorkerStartDuration)
 		legacyregistry.MustRegister(ContainersPerPodCount)
@@ -385,6 +448,9 @@ func Register(containerCache kubecontainer.RuntimeCache, collectors ...metrics.S
 		legacyregistry.MustRegister(RuntimeOperations)
 		legacyregistry.MustRegister(RuntimeOperationsDuration)
 		legacyregistry.MustRegister(RuntimeOperationsErrors)
+		legacyregistry.MustRegister(RuntimeImagePullDuration)
+		legacyregistry.MustRegister(RuntimeImagePullCount)
+		legacyregistry.MustRegister(RuntimeImagePullCacheHitCount)
 		legacyregistry.MustRegister(Evictions)
 		legacyregistry.MustRegister(EvictionStatsAge)
 		legacyregistry.MustRegister(Preemptions)
