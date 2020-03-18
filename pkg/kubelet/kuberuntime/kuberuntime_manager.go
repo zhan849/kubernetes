@@ -25,7 +25,7 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"k8s.io/klog"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -37,6 +37,7 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/credentialprovider"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
@@ -460,11 +461,142 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 	return cStatus.ExitCode == 0
 }
 
+// oneOffPodAllContainersReachedFinalState returns true all containers reached final (exited) state
+// if container status is missing, or they are created/running/unknown, they are not in the final state
+func oneOffPodAllContainersReachedFinalState(pod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
+	if !podutil.IsOneOffPod(pod) {
+		return false
+	}
+
+	// we don't need to check init container here for short path - if any init container has not reached final
+	// state, main containers will not have been even created
+	for _, c := range pod.Spec.Containers {
+		containerStatus := podStatus.FindContainerStatusByName(c.Name)
+		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateExited {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldRestartContainerInOneOffPod determines if a container in an one-off pod should be restarted with the given
+// conditions. This function assumes the pod is an one-off pod
+func shouldRestartContainerInOneOffPod(pod *v1.Pod, container *v1.Container, containerStatus *kubecontainer.ContainerStatus, podStatus *kubecontainer.PodStatus,
+	allMainSucceeded, allMainExited bool) bool {
+	if containerStatus == nil {
+		// If we don't even have a container status, a.k.a container not even created, we should NOT restart only when
+		// all main containers are finished and this is a sidecar
+		return !(podutil.IsSideCar(container) && oneOffPodMainContainersAllFinished(pod, allMainSucceeded, allMainExited))
+	}
+
+	// container is not running or unknown
+	if podutil.IsSideCar(container) {
+		if containerStatus.State == kubecontainer.ContainerStateRunning {
+			// don't restart container that is already running
+			return false
+		}
+
+
+
+		// Sidecar shall not be managed by pod restart policy as it serves as a baby-sitting role
+		// Always restart sidecar if we still need to keep the main
+		return !oneOffPodMainContainersAllFinished(pod, allMainSucceeded, allMainExited)
+	}
+
+	// Main container honors existing behavior
+	return kubecontainer.ShouldContainerBeRestarted(container, pod, podStatus)
+}
+
+// oneOffPodMainContainersAllFinished checks if main is still running or we are planning to restart main
+// This function assumes the pod is an one-off pod
+func oneOffPodMainContainersAllFinished(pod *v1.Pod, allMainSucceeded, allMainExited bool) bool {
+	if pod.Spec.RestartPolicy == v1.RestartPolicyAlways {
+		return false
+	}
+	return (pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure && allMainSucceeded) ||
+		(pod.Spec.RestartPolicy == v1.RestartPolicyNever && allMainExited)
+}
+
+func collectOneOffPodContainerStatusFlags(pod *v1.Pod, podStatus *kubecontainer.PodStatus) (allMainExited bool, allMainSucceeded bool, allExited bool, hasSidecarInProgress bool) {
+
+	allMainExited = true
+	allMainSucceeded = true
+	allExited = true
+	hasSidecarInProgress = false
+
+	var containersWithNoStatus []string
+	for _, c := range pod.Spec.Containers {
+		containerStatus := podStatus.FindContainerStatusByName(c.Name)
+		if containerStatus != nil {
+			// the container is in progress
+			if containerStatus.State != kubecontainer.ContainerStateExited {
+				// container in created / running, we keep the pod there for further reconciliation
+				allExited = false
+				if !podutil.IsSideCar(&c) {
+					allMainExited = false
+					allMainSucceeded = false
+				} else {
+					hasSidecarInProgress = true
+				}
+			} else {
+				// container exited
+				if !podutil.IsSideCar(&c) && containerStatus.ExitCode != 0 {
+					// its a main container and it failed
+					allMainSucceeded = false
+				}
+			}
+		} else {
+			// container not in progress as there is no status exist
+			if !podutil.IsSideCar(&c) {
+				allMainExited = false
+				allMainSucceeded = false
+			}
+			allExited = false
+			containersWithNoStatus = append(containersWithNoStatus, c.Name)
+		}
+	}
+	klog.V(4).Infof("Pod %q: the following container does not have status: %v", format.Pod(pod), containersWithNoStatus)
+	return allMainExited, allMainSucceeded, allExited, hasSidecarInProgress
+}
+
 // computePodActions checks whether the pod spec has changed and returns the changes if true.
 func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
-	klog.V(5).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
+	klog.V(4).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
 
 	createPodSandbox, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
+
+	// Regarding one-off pods, there is a complicated race. Consider this case:
+	//
+	// Pod has 1 main container and 2 sidecars
+	//    - main container finishes
+	//    - computePodActions determines that we should kill the 2 sidecars
+	//    - we issue kill command to the 2 sidecar containers
+	//    - 1st sidecar exited and triggers pod sync
+	//    - 2nd sidecar exited and event is queued
+	//    - we reconcile container statuses and found the 2 sidecar are both exited
+	//    - we kill pod by killing sandbox
+	//    - we started to process sidecar exit event for 2nd sidecar
+	//    - we don't have a pod sandbox now and podSandboxChanged() returned that we should create sandbox
+	//    - we failed to create sandbox because the pod cgroup is already being teared down
+	//
+	// this does not happen when we only have 1 sidecar or for long running pods, where we don't need to proactively
+	// kill container besides gets instruction to kill pods directly.
+	//
+	// This shall be added into podSandboxChanged() and have an optimization of container iteration logic, but to
+	// limite the scope of change, it's better to add it here in place
+	if oneOffPodAllContainersReachedFinalState(pod, podStatus) && createPodSandbox {
+		klog.Infof("One-off pod %q all container finished and pod sandbox not ready => pod has been teared down cleanly, no action",
+			format.Pod(pod))
+		return podActions{
+			KillPod:           true,
+			CreateSandbox:     false,
+			SandboxID:         sandboxID,
+			Attempt:           attempt,
+			ContainersToStart: []int{},
+			ContainersToKill:  map[kubecontainer.ContainerID]containerToKillInfo{},
+		}
+	}
+
 	changes := podActions{
 		KillPod:           createPodSandbox,
 		CreateSandbox:     createPodSandbox,
@@ -542,6 +674,9 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		return changes
 	}
 
+	// Pinterest specific side car handling logic
+	allMainExited, allMainSucceeded, allExited, hasSidecarInProgress := collectOneOffPodContainerStatusFlags(pod, podStatus)
+
 	// Number of running containers to keep.
 	keepCount := 0
 	// check the status of containers.
@@ -561,9 +696,20 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
-			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
+			shouldRestart := false
+			if podutil.IsOneOffPod(pod) {
+				// case 1: one-off pod
+				// use specific logic to handle
+				shouldRestart = shouldRestartContainerInOneOffPod(pod, &container, containerStatus, podStatus, allMainSucceeded, allMainExited)
+			} else {
+				// case 2: not one off pod
+				// use the original container restart check
+				shouldRestart = kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus)
+			}
+
+			if shouldRestart {
 				message := fmt.Sprintf("Container %+v is dead, but RestartPolicy says that we should restart it.", container)
-				klog.V(3).Infof(message)
+				klog.Infof(message)
 				changes.ContainersToStart = append(changes.ContainersToStart, idx)
 				if containerStatus != nil && containerStatus.State == kubecontainer.ContainerStateUnknown {
 					// If container is in unknown state, we don't know whether it
@@ -590,6 +736,21 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		} else if liveness, found := m.livenessManager.Get(containerStatus.ID); found && liveness == proberesults.Failure {
 			// If the container failed the liveness probe, we should kill it.
 			message = fmt.Sprintf("Container %s failed liveness probe", container.Name)
+		} else if podutil.IsOneOffPod(pod) && podutil.IsSideCar(&container) {
+			// We kill side car and not restart it in the following 2 scenarios:
+			//   1. Pod restart policy is Never and all main containers exited (In this case, main will not be recreated)
+			//  2. Pod restart policy is OnFailure and all main containers succeeded
+			// If neither of these 2 cases, i.e. main is still running or we are planning to restart main (main failed
+			// but policy says restart on failure) we should keep the sidecar
+			//
+			// leaving the change in a special block to make it local
+			if oneOffPodMainContainersAllFinished(pod, allMainSucceeded, allMainExited) {
+				message = fmt.Sprintf("Kill sidecar %s as main containers are all finished", container.Name)
+				restart = false
+			} else {
+				keepCount += 1
+				continue
+			}
 		} else {
 			// Keep the container.
 			keepCount++
@@ -609,11 +770,30 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 			container: &pod.Spec.Containers[idx],
 			message:   message,
 		}
-		klog.V(2).Infof("Container %q (%q) of pod %s: %s", container.Name, containerStatus.ID, format.Pod(pod), message)
+		klog.Infof("Container %q (%q) of pod %s: %s", container.Name, containerStatus.ID, format.Pod(pod), message)
 	}
 
-	if keepCount == 0 && len(changes.ContainersToStart) == 0 {
-		changes.KillPod = true
+	if podutil.IsOneOffPod(pod) {
+		// because we need to actively kill side car containers for one-off pods,
+		// we kill pod container only when all non-init containers are terminated
+		if !changes.CreateSandbox {
+			if allExited {
+				// it's possible that we still need to restart container
+				changes.KillPod = keepCount == 0 && len(changes.ContainersToStart) == 0
+				klog.Infof("One-off pod %q all containers are exited, Keep: %d, ToStart: %d, KillInfra: %t",
+					format.Pod(pod), keepCount, len(changes.ContainersToStart), changes.KillPod)
+			} else if oneOffPodMainContainersAllFinished(pod, allMainSucceeded, allMainExited) && !hasSidecarInProgress {
+				// All main containers are finished, and there is no sidecar in progress anymore
+				changes.KillPod = true
+				klog.Infof("One-off pod %q all main containers are exited, and no sidecar in progress killing pod infra", format.Pod(pod))
+			}
+
+		}
+	} else {
+		// keep the original logic
+		if keepCount == 0 && len(changes.ContainersToStart) == 0 {
+			changes.KillPod = true
+		}
 	}
 
 	return changes
@@ -631,7 +811,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontainer.PodStatus, pullSecrets []v1.Secret, backOff *flowcontrol.Backoff) (result kubecontainer.PodSyncResult) {
 	// Step 1: Compute sandbox and container changes.
 	podContainerChanges := m.computePodActions(pod, podStatus)
-	klog.V(3).Infof("computePodActions got %+v for pod %q", podContainerChanges, format.Pod(pod))
+	klog.Infof("computePodActions got %+v for pod %q", podContainerChanges, format.Pod(pod))
 	if podContainerChanges.CreateSandbox {
 		ref, err := ref.GetReference(legacyscheme.Scheme, pod)
 		if err != nil {
@@ -640,16 +820,16 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		if podContainerChanges.SandboxID != "" {
 			m.recorder.Eventf(ref, v1.EventTypeNormal, events.SandboxChanged, "Pod sandbox changed, it will be killed and re-created.")
 		} else {
-			klog.V(4).Infof("SyncPod received new pod %q, will create a sandbox for it", format.Pod(pod))
+			klog.Infof("SyncPod received new pod %q, will create a sandbox for it", format.Pod(pod))
 		}
 	}
 
 	// Step 2: Kill the pod if the sandbox has changed.
 	if podContainerChanges.KillPod {
 		if podContainerChanges.CreateSandbox {
-			klog.V(4).Infof("Stopping PodSandbox for %q, will start new one", format.Pod(pod))
+			klog.Infof("Stopping PodSandbox for %q, will start new one", format.Pod(pod))
 		} else {
-			klog.V(4).Infof("Stopping PodSandbox for %q because all other containers are dead.", format.Pod(pod))
+			klog.Infof("Stopping PodSandbox for %q because all other containers are dead.", format.Pod(pod))
 		}
 
 		killResult := m.killPodWithSyncResult(pod, kubecontainer.ConvertPodStatusToRunningPod(m.runtimeName, podStatus), nil)
@@ -665,7 +845,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 	} else {
 		// Step 3: kill any running containers in this pod which are not to keep.
 		for containerID, containerInfo := range podContainerChanges.ContainersToKill {
-			klog.V(3).Infof("Killing unwanted container %q(id=%q) for pod %q", containerInfo.name, containerID, format.Pod(pod))
+			klog.Infof("Killing unwanted container %q(id=%q) for pod %q", containerInfo.name, containerID, format.Pod(pod))
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, containerInfo.name)
 			result.AddSyncResult(killContainerResult)
 			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, nil); err != nil {
@@ -701,7 +881,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		var msg string
 		var err error
 
-		klog.V(4).Infof("Creating sandbox for pod %q", format.Pod(pod))
+		klog.Infof("Creating sandbox for pod %q", format.Pod(pod))
 		createSandboxResult := kubecontainer.NewSyncResult(kubecontainer.CreatePodSandbox, format.Pod(pod))
 		result.AddSyncResult(createSandboxResult)
 		podSandboxID, msg, err = m.createPodSandbox(pod, podContainerChanges.Attempt)
@@ -715,7 +895,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 			m.recorder.Eventf(ref, v1.EventTypeWarning, events.FailedCreatePodSandBox, "Failed create pod sandbox: %v", err)
 			return
 		}
-		klog.V(4).Infof("Created PodSandbox %q for pod %q", podSandboxID, format.Pod(pod))
+		klog.Infof("Created PodSandbox %q for pod %q", podSandboxID, format.Pod(pod))
 
 		podSandboxStatus, err := m.runtimeService.PodSandboxStatus(podSandboxID)
 		if err != nil {
@@ -734,7 +914,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		if !kubecontainer.IsHostNetworkPod(pod) {
 			// Overwrite the podIPs passed in the pod status, since we just started the pod sandbox.
 			podIPs = m.determinePodSandboxIPs(pod.Namespace, pod.Name, podSandboxStatus)
-			klog.V(4).Infof("Determined the ip %v for pod %q after sandbox changed", podIPs, format.Pod(pod))
+			klog.Infof("Determined the ip %v for pod %q after sandbox changed", podIPs, format.Pod(pod))
 		}
 	}
 
@@ -767,18 +947,18 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		isInBackOff, msg, err := m.doBackOff(pod, container, podStatus, backOff)
 		if isInBackOff {
 			startContainerResult.Fail(err, msg)
-			klog.V(4).Infof("Backing Off restarting %v %+v in pod %v", typeName, container, format.Pod(pod))
+			klog.Infof("Backing Off restarting %v %+v in pod %v", typeName, container, format.Pod(pod))
 			return err
 		}
 
-		klog.V(4).Infof("Creating %v %+v in pod %v", typeName, container, format.Pod(pod))
+		klog.Infof("Creating %v %+v in pod %v", typeName, container, format.Pod(pod))
 		if msg, err := m.startContainer(podSandboxID, podSandboxConfig, container, pod, podStatus, pullSecrets, podIP); err != nil {
 			startContainerResult.Fail(err, msg)
 			// known errors that are logged in other places are logged at higher levels here to avoid
 			// repetitive log spam
 			switch {
 			case err == images.ErrImagePullBackOff:
-				klog.V(3).Infof("%v start failed: %v: %s", typeName, err, msg)
+				klog.Infof("%v start failed: %v: %s", typeName, err, msg)
 			default:
 				utilruntime.HandleError(fmt.Errorf("%v start failed: %v: %s", typeName, err, msg))
 			}
@@ -795,7 +975,9 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 	if utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
 		for _, idx := range podContainerChanges.EphemeralContainersToStart {
 			c := (*v1.Container)(&pod.Spec.EphemeralContainers[idx].EphemeralContainerCommon)
-			start("ephemeral container", c)
+			if err := start("ephemeral container", c); err != nil {
+				klog.Warningf("Failed to start ephemeral container %s: %+v", c.Name, err)
+			}
 		}
 	}
 
@@ -803,16 +985,21 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 	if container := podContainerChanges.NextInitContainerToStart; container != nil {
 		// Start the next init container.
 		if err := start("init container", container); err != nil {
+			// init container is ordered so we have to quit here
+			klog.Warningf("Failed to start init container %s: %+v", container.Name, err)
 			return
 		}
 
 		// Successfully started the container; clear the entry in the failure
-		klog.V(4).Infof("Completed init container %q for pod %q", container.Name, format.Pod(pod))
+		klog.Infof("Completed init container %q for pod %q", container.Name, format.Pod(pod))
 	}
 
 	// Step 7: start containers in podContainerChanges.ContainersToStart.
 	for _, idx := range podContainerChanges.ContainersToStart {
-		start("container", &pod.Spec.Containers[idx])
+		if err := start("container", &pod.Spec.Containers[idx]); err != nil {
+			// main container is not ordered, so we start as many containers as we can
+			klog.Warningf("Failed to start main container %s: %+v", pod.Spec.Containers[idx].Name, err)
+		}
 	}
 
 	return
